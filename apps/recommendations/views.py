@@ -168,6 +168,10 @@ class TrainModelsView(APIView):
 
         results, _ = train_all_models(varieties)
 
+        # Drop rows for algorithms we no longer train (e.g. legacy
+        # agglomerative/dbscan entries from older versions).
+        ClusterModel.objects.exclude(name__in=list(results.keys())).delete()
+
         saved = []
         for name, res in results.items():
             cm, _ = ClusterModel.objects.update_or_create(
@@ -177,12 +181,13 @@ class TrainModelsView(APIView):
                     'silhouette_score': res['silhouette'],
                     'davies_bouldin':   res['davies_bouldin'],
                     'n_clusters':       res['n_clusters'],
-                    'is_active':        False,
+                    # K-Means is the only model — make it active immediately.
+                    'is_active':        True,
                 }
             )
             saved.append(ClusterModelSerializer(cm).data)
 
-        return Response({'models': saved, 'message': 'Training complete. Select the best model in admin.'})
+        return Response({'models': saved, 'message': 'Training complete. K-Means is now the active model.'})
 
 
 class SetActiveModelView(APIView):

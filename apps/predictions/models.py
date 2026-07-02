@@ -4,8 +4,6 @@ from django.db import models
 class YieldPredictionModel(models.Model):
     MODEL_CHOICES = [
         ('linear', 'Linear Regression'),
-        ('ridge',  'Ridge Regression'),
-        ('lasso',  'Lasso Regression'),
     ]
 
     model_type       = models.CharField(max_length=20, choices=MODEL_CHOICES)

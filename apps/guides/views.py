@@ -1,4 +1,6 @@
 from datetime import timedelta, datetime
+from django.db import transaction
+from django.db.models import Max
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.generics import ListAPIView, RetrieveAPIView
@@ -13,8 +15,6 @@ from apps.recommendations.models import Recommendation
 
 import os
 import json
-import time
-import hashlib
 import requests
 
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
@@ -26,29 +26,36 @@ GEMINI_URL = (
 )
 GUIDE_CATEGORIES = ['planting', 'fertilizer', 'pest_prevention', 'irrigation', 'harvesting']
 
-# ── In-memory cache so we don't burn Gemini quota when nothing changed ─────────
-# Key = (rec_id, season, hash of logs payload).
-# Value = (timestamp, response_dict). 5-minute TTL.
-_GUIDE_CACHE = {}
-_CACHE_TTL_SECONDS = 300
+# ── Persisted-guide response shape ─────────────────────────────────────────────
+# Steps are saved as GuideStep rows; responses carry the real DB id so the
+# mobile app's completion sync (PATCH steps/<id>/complete/) targets real rows.
 
-def _make_cache_key(rec_id, season, logs):
-    logs_blob = json.dumps(logs or [], sort_keys=True, default=str)
-    h = hashlib.md5(logs_blob.encode('utf-8')).hexdigest()[:12]
-    return f"{rec_id}|{season}|{h}"
+def _step_dict(st):
+    return {
+        'id':                st.id,
+        'stepNumber':        st.step_no,
+        'title':             st.title,
+        'instruction':       st.description,
+        'daysAfterPlanting': st.days_after_planting if st.days_after_planting is not None else 0,
+        'category':          st.category or 'planting',
+        'is_completed':      st.is_completed,
+    }
 
-def _cache_get(key):
-    entry = _GUIDE_CACHE.get(key)
-    if not entry:
-        return None
-    ts, resp = entry
-    if time.time() - ts > _CACHE_TTL_SECONDS:
-        _GUIDE_CACHE.pop(key, None)
-        return None
-    return resp
-
-def _cache_set(key, resp):
-    _GUIDE_CACHE[key] = (time.time(), resp)
+def _guide_response(guide, source):
+    steps = [
+        _step_dict(st)
+        for st in guide.steps.order_by('days_after_planting', 'step_no')
+    ]
+    return {
+        'id':         guide.id,
+        'farm':       guide.farm_id,
+        'variety':    guide.variety_id,
+        'season':     guide.season,
+        'language':   guide.language,
+        'start_date': guide.start_date.isoformat() if guide.start_date else None,
+        'source':     source,
+        'steps':      steps,
+    }
 
 
 # ── Open-Meteo 7-day forecast for the farm's coords ────────────────────────────
@@ -538,17 +545,21 @@ class GeneratePlantingGuideView(APIView):
             language = 'en'
 
         # Inputs from the frontend payload — adaptive context for Gemini
-        logs    = request.data.get('logs') or []
+        logs  = request.data.get('logs') or []
+        force = bool(request.data.get('force_regenerate'))
 
-        # ── Cache check ────────────────────────────────────────────────────────
-        # Same (recId, season, language, logs) within 5 min → return cached response.
-        # Language is part of the key so switching languages re-generates instead
-        # of returning stale text in the wrong language.
-        cache_key = _make_cache_key(recommendation_id, f'{season}|{language}', logs)
-        cached = _cache_get(cache_key)
-        if cached:
-            print(f'[PLANTING GUIDE] ⚡ CACHE HIT (key={cache_key[-12:]}) — skipping Gemini call', flush=True)
-            return Response(cached, status=status.HTTP_200_OK)
+        # ── Saved-steps fast path ──────────────────────────────────────────────
+        # Steps are persisted as GuideStep rows so completion survives reinstalls
+        # and other devices. Return the saved checklist unless the language
+        # changed or the caller explicitly asks to regenerate. Adaptivity after
+        # first generation comes from the append-step flow, not full regen.
+        guide, _ = PlantingGuide.objects.get_or_create(
+            farm=farm, variety=variety, season=season,
+            defaults={'start_date': timezone.now().date(), 'language': language},
+        )
+        if not force and guide.language == language and guide.steps.exists():
+            print(f'[PLANTING GUIDE] ⚡ SAVED steps for guide={guide.id} — skipping Gemini call', flush=True)
+            return Response(_guide_response(guide, source='SAVED'), status=status.HTTP_200_OK)
 
         # Latest environmental scan for this farm (soil + weather + flood)
         scan = farm.environmental_scans.order_by('-id').first() if hasattr(farm, 'environmental_scans') else None
@@ -574,31 +585,29 @@ class GeneratePlantingGuideView(APIView):
 
         print(f'[PLANTING GUIDE] source={source} | steps={len(steps)}', flush=True)
 
-        # Track the cycle in DB (PlantingGuide row only — steps are ephemeral so
-        # they can change every call without polluting GuideStep history).
-        start_date = timezone.now().date()
-        guide, _ = PlantingGuide.objects.get_or_create(
-            farm=farm, variety=variety, season=season,
-            defaults={'start_date': start_date},
-        )
+        # Persist the generated steps as real GuideStep rows. Completion is then
+        # tracked on the row (is_completed), so it survives app reinstalls and
+        # syncs across devices. Regeneration replaces the checklist wholesale —
+        # a new plan is a new checklist, so completions reset by design.
+        with transaction.atomic():
+            guide.steps.all().delete()
+            rows = []
+            for idx, st in enumerate(steps, start=1):
+                dap = int(st.get('daysAfterPlanting', 0))
+                rows.append(GuideStep(
+                    guide=guide,
+                    step_no=idx,   # enumerate: Gemini stepNumbers can repeat, (guide, step_no) is unique
+                    title=st.get('title', '')[:150],
+                    description=st.get('instruction', ''),
+                    category=st.get('category', ''),
+                    days_after_planting=dap,
+                    scheduled_date=(guide.start_date + timedelta(days=dap)) if guide.start_date else None,
+                ))
+            GuideStep.objects.bulk_create(rows)
+            guide.language = language
+            guide.save(update_fields=['language'])
 
-        response_dict = {
-            'id':         guide.id,
-            'farm':       farm.id,
-            'variety':    variety.id,
-            'season':     season,
-            'start_date': guide.start_date.isoformat() if guide.start_date else None,
-            'source':     source,
-            'steps':      steps,
-        }
-
-        # Cache successful Gemini results so the next 5 min of identical requests
-        # are served instantly. Don't cache fallback — we want to retry Gemini
-        # next time instead of locking in the template for 5 min.
-        if source == 'GEMINI':
-            _cache_set(cache_key, response_dict)
-
-        return Response(response_dict, status=status.HTTP_200_OK)
+        return Response(_guide_response(guide, source=source), status=status.HTTP_200_OK)
 
 
 class AppendGuideStepView(APIView):
@@ -647,11 +656,10 @@ class AppendGuideStepView(APIView):
 
         variety = top_result.variety
         farm    = rec.farm
+        season  = request.data.get('season', 'Wet Season')
         scan    = farm.environmental_scans.order_by('-id').first() if hasattr(farm, 'environmental_scans') else None
         forecast = _get_forecast(getattr(farm, 'latitude', None), getattr(farm, 'longitude', None))
 
-        # Unique step id — pick the next index after the current list so it sorts last.
-        # If existing_count not provided, fall back to a timestamp-based id.
         base_index = max(existing_count + 1, 12)
         step = _generate_one_step(
             variety, scan, logs, forecast, language, category, last_day, base_index,
@@ -659,9 +667,27 @@ class AppendGuideStepView(APIView):
         if not step:
             return Response({'detail': 'Could not generate next step right now.'}, status=503)
 
-        # Ensure the id won't collide with any existing template / Gemini ids
-        step['id'] = f'extra_{int(time.time())}_{base_index:03d}'
-        return Response({'step': step}, status=status.HTTP_200_OK)
+        # Persist the new step on the farm's guide so it has a real DB id —
+        # completion sync and reinstall-restore then work the same as the
+        # originally generated steps.
+        guide, _ = PlantingGuide.objects.get_or_create(
+            farm=farm, variety=variety, season=season,
+            defaults={'start_date': timezone.now().date(), 'language': language},
+        )
+        dap = int(step.get('daysAfterPlanting', last_day + 7))
+        with transaction.atomic():
+            next_no = (guide.steps.aggregate(m=Max('step_no'))['m'] or 0) + 1
+            row = GuideStep.objects.create(
+                guide=guide,
+                step_no=next_no,
+                title=str(step.get('title', ''))[:150],
+                description=str(step.get('instruction', '')),
+                category=step.get('category', category),
+                days_after_planting=dap,
+                scheduled_date=(guide.start_date + timedelta(days=dap)) if guide.start_date else None,
+            )
+
+        return Response({'step': _step_dict(row)}, status=status.HTTP_200_OK)
 
 
 class PlantingGuideListView(ListAPIView):
@@ -681,8 +707,12 @@ class PlantingGuideDetailView(RetrieveAPIView):
 
 
 class MarkStepCompleteView(APIView):
-    """Legacy endpoint — frontend now tracks step completion locally since Gemini
-    steps are ephemeral (different each call). Kept for backward compatibility."""
+    """Set a guide step's completion. Steps are persisted GuideStep rows, so this
+    is the durable source of truth — reinstalling the app or logging in on
+    another device restores check-offs from here.
+
+    PATCH body: { "is_completed": true | false }   (defaults to true)
+    """
     permission_classes = [IsAuthenticated]
 
     def patch(self, request, step_id):
@@ -693,7 +723,8 @@ class MarkStepCompleteView(APIView):
         except GuideStep.DoesNotExist:
             return Response({'detail': 'Step not found.'}, status=404)
 
-        step.is_completed = True
-        step.completed_at = timezone.now()
-        step.save()
+        done = bool(request.data.get('is_completed', True))
+        step.is_completed = done
+        step.completed_at = timezone.now() if done else None
+        step.save(update_fields=['is_completed', 'completed_at'])
         return Response(GuideStepSerializer(step).data)

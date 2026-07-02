@@ -1,9 +1,9 @@
 """
 python manage.py train_yield_models
 
-Trains 3 regression models (Linear, Ridge, Lasso) for yield prediction.
-Compares R², MAE, RMSE — saves the best as active.
-Safe to re-run anytime.
+Trains the Linear Regression yield model (real YieldRecords when >= 30 exist,
+otherwise the agronomy-calibrated synthetic dataset). Reports test R2/MAE/RMSE
+plus 5-fold CV in notes. Safe to re-run anytime.
 """
 from django.core.management.base import BaseCommand
 from apps.predictions.models import YieldPredictionModel
@@ -11,7 +11,7 @@ from apps.predictions.services import train_all_models
 
 
 class Command(BaseCommand):
-    help = 'Train Linear, Ridge, Lasso regression models for yield prediction'
+    help = 'Train the Linear Regression yield prediction model'
 
     def handle(self, *args, **options):
         self.stdout.write('Training yield prediction models...')

@@ -1,12 +1,19 @@
 """
-Clustering Engine — 3 models compared by speed + quality.
-Admin trains all 3, picks the best, that model is used for recommendations.
+Clustering Engine — K-Means.
+
+Groups rice varieties by agro-climatic similarity. Each variety becomes a
+9-feature vector; features are standardized; K-Means assigns a cluster label
+that is stored as supplementary metadata on recommendation results (the
+ranking itself is purely RSI).
+
+Training searches k = 2..8 and keeps the k with the best silhouette score,
+using n_init=50 and a fixed random_state so results are stable and
+reproducible across runs.
 """
 import time
 import numpy as np
 import joblib
-from pathlib import Path
-from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN
+from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 from django.conf import settings
@@ -15,6 +22,10 @@ MODELS_DIR = settings.MODELS_DIR
 
 TOLERANCE_MAP = {'low': 0, 'moderate': 1, 'high': 2}
 ECOSYSTEM_MAP = {'irrigated_lowland': 0, 'rainfed_lowland': 1, 'upland': 2}
+
+# Search range for the number of clusters (upper bound also capped at n-1)
+K_MIN = 2
+K_MAX = 8
 
 
 def _build_feature_matrix(varieties):
@@ -34,72 +45,55 @@ def _build_feature_matrix(varieties):
     return np.array(rows, dtype=float)
 
 
-def train_all_models(varieties, n_clusters=4):
+def train_all_models(varieties, n_clusters=None):
+    """
+    Train K-Means on the variety feature matrix.
+
+    Searches k in [K_MIN, min(K_MAX, n-1)] and keeps the k with the highest
+    silhouette score — unless `n_clusters` pins a specific k. Persists the
+    fitted scaler + model to disk.
+
+    Returns ({'kmeans': metrics}, X_scaled). The metrics dict includes a
+    `search_log` listing silhouette/DBI for every k tried, for transparency.
+    """
     X = _build_feature_matrix(varieties)
+    n_samples = X.shape[0]
+    if n_samples < K_MIN + 1:
+        raise ValueError(f'Need at least {K_MIN + 1} varieties to cluster (got {n_samples}).')
+
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    results = {}
+    k_hi = min(K_MAX, n_samples - 1)
+    candidates = [int(n_clusters)] if n_clusters else list(range(K_MIN, k_hi + 1))
 
-    # ── 1. K-Means ─────────────────────────────────────────────────────────
+    best, search_log = None, []
     t0 = time.perf_counter()
-    km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    km_labels = km.fit_predict(X_scaled)
-    km_time = round((time.perf_counter() - t0) * 1000, 3)
-    results['kmeans'] = {
-        'model':           km,
-        'labels':          km_labels.tolist(),
-        'training_time_ms': km_time,
-        'silhouette':      round(silhouette_score(X_scaled, km_labels), 4),
-        'davies_bouldin':  round(davies_bouldin_score(X_scaled, km_labels), 4),
-        'n_clusters':      n_clusters,
-    }
+    for k in candidates:
+        km = KMeans(n_clusters=k, random_state=42, n_init=50)
+        labels = km.fit_predict(X_scaled)
+        sil = round(float(silhouette_score(X_scaled, labels)), 4)
+        dbi = round(float(davies_bouldin_score(X_scaled, labels)), 4)
+        search_log.append({'k': k, 'silhouette': sil, 'davies_bouldin': dbi})
+        if best is None or sil > best['silhouette']:
+            best = {
+                'model':          km,
+                'labels':         labels.tolist(),
+                'silhouette':     sil,
+                'davies_bouldin': dbi,
+                'n_clusters':     k,
+            }
+    best['training_time_ms'] = round((time.perf_counter() - t0) * 1000, 3)
+    best['search_log']       = search_log
 
-    # ── 2. Agglomerative Hierarchical ──────────────────────────────────────
-    t0 = time.perf_counter()
-    ag = AgglomerativeClustering(n_clusters=n_clusters)
-    ag_labels = ag.fit_predict(X_scaled)
-    ag_time = round((time.perf_counter() - t0) * 1000, 3)
-    results['agglomerative'] = {
-        'model':           ag,
-        'labels':          ag_labels.tolist(),
-        'training_time_ms': ag_time,
-        'silhouette':      round(silhouette_score(X_scaled, ag_labels), 4),
-        'davies_bouldin':  round(davies_bouldin_score(X_scaled, ag_labels), 4),
-        'n_clusters':      n_clusters,
-    }
-
-    # ── 3. DBSCAN ──────────────────────────────────────────────────────────
-    t0 = time.perf_counter()
-    db = DBSCAN(eps=0.8, min_samples=2)
-    db_labels = db.fit_predict(X_scaled)
-    db_time = round((time.perf_counter() - t0) * 1000, 3)
-    n_db_clusters = len(set(db_labels)) - (1 if -1 in db_labels else 0)
-    try:
-        db_sil = round(silhouette_score(X_scaled, db_labels), 4) if n_db_clusters > 1 else 0
-        db_dbi = round(davies_bouldin_score(X_scaled, db_labels), 4) if n_db_clusters > 1 else 99
-    except Exception:
-        db_sil, db_dbi = 0, 99
-    results['dbscan'] = {
-        'model':           db,
-        'labels':          db_labels.tolist(),
-        'training_time_ms': db_time,
-        'silhouette':      db_sil,
-        'davies_bouldin':  db_dbi,
-        'n_clusters':      n_db_clusters,
-    }
-
-    # Save scaler
     joblib.dump(scaler, MODELS_DIR / 'scaler.pkl')
+    joblib.dump(best['model'], MODELS_DIR / 'kmeans.pkl')
 
-    # Save each model
-    for name, res in results.items():
-        joblib.dump(res['model'], MODELS_DIR / f'{name}.pkl')
-
-    return results, X_scaled
+    return {'kmeans': best}, X_scaled
 
 
-def predict_cluster(variety, active_model_name: str) -> int:
+def predict_cluster(variety, active_model_name: str = 'kmeans') -> int:
+    """Cluster label for a single variety (0 if the model isn't trained yet)."""
     scaler_path = MODELS_DIR / 'scaler.pkl'
     model_path  = MODELS_DIR / f'{active_model_name}.pkl'
 
@@ -127,7 +121,8 @@ def predict_cluster(variety, active_model_name: str) -> int:
     return 0
 
 
-def get_farm_cluster(scan, ecosystem: str, active_model_name: str) -> int:
+def get_farm_cluster(scan, ecosystem: str, active_model_name: str = 'kmeans') -> int:
+    """Cluster label for a farm, derived from its latest environmental scan."""
     scaler_path = MODELS_DIR / 'scaler.pkl'
     model_path  = MODELS_DIR / f'{active_model_name}.pkl'
 

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv\\\\\\\\Scripts\\\\\\\\activate.bat)",
+      "Bash(python -m venv venv)"
+    ]
+  }
+}

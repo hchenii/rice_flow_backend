@@ -8,6 +8,9 @@ class PlantingGuide(models.Model):
     variety     = models.ForeignKey(RiceVariety, on_delete=models.CASCADE, related_name='planting_guides')
     season      = models.CharField(max_length=30)
     start_date  = models.DateField()
+    # Language the saved steps were generated in — a request in a different
+    # language triggers regeneration instead of returning mismatched text.
+    language    = models.CharField(max_length=5, default='en')
     created_at  = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -23,6 +26,8 @@ class GuideStep(models.Model):
     step_no         = models.IntegerField()
     title           = models.CharField(max_length=150)
     description     = models.TextField()
+    category        = models.CharField(max_length=20, blank=True, default='')
+    days_after_planting = models.IntegerField(null=True, blank=True)
     scheduled_date  = models.DateField(null=True, blank=True)
     is_completed    = models.BooleanField(default=False)
     completed_at    = models.DateTimeField(null=True, blank=True)

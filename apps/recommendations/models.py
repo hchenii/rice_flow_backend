@@ -34,9 +34,7 @@ class SuitabilityRuleSet(models.Model):
 
 class ClusterModel(models.Model):
     MODEL_CHOICES = [
-        ('kmeans',        'K-Means'),
-        ('agglomerative', 'Agglomerative Hierarchical'),
-        ('dbscan',        'DBSCAN'),
+        ('kmeans', 'K-Means'),
     ]
     name              = models.CharField(max_length=20, choices=MODEL_CHOICES)
     training_time_ms  = models.FloatField()
