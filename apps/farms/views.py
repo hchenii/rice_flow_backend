@@ -1,3 +1,5 @@
+from datetime import timedelta
+from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -11,7 +13,30 @@ class FarmListCreateView(generics.ListCreateAPIView):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        # Object-level scoping: a user only ever sees their own farms.
         return Farm.objects.filter(user=self.request.user)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # Idempotency guard: if the same farm (same user + name + coordinates)
+        # was created in the last 5 minutes, return it instead of inserting a
+        # duplicate. Protects against double-submits / screen remounts in the
+        # add-farm flow that otherwise create two identical farms.
+        v    = serializer.validated_data
+        dupe = Farm.objects.filter(
+            user=request.user,
+            name=v.get('name'),
+            latitude=v.get('latitude'),
+            longitude=v.get('longitude'),
+            created_at__gte=timezone.now() - timedelta(minutes=5),
+        ).first()
+        if dupe:
+            return Response(FarmSerializer(dupe).data, status=status.HTTP_200_OK)
+
+        self.perform_create(serializer)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
