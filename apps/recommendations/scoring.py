@@ -256,3 +256,93 @@ def calculate_rsi(variety, scan, ecosystem: str) -> dict:
         'suitability_class': suitability_class,
         'factor_scores':    scores,
     }
+
+
+#FROM CODEX
+
+"""Pure scoring utilities for rice-variety recommendations.
+
+This module deliberately has no Django model imports or database writes.  It is
+safe to call from a view, service, serializer, or recommendation task.
+"""
+
+from __future__ import annotations
+
+from numbers import Real
+from typing import Any, Mapping
+
+
+DEFAULT_PROFILE: dict[str, tuple[float, float]] = {
+    "ideal_ph_range": (6.0, 7.0),
+    "ideal_temperature_range": (24.0, 32.0),
+}
+
+
+def _valid_number(value: Any) -> float | None:
+    """Return a non-negative finite number, or None for unusable input."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    number = float(value)
+    if number < 0 or number == float("inf") or number == float("-inf") or number != number:
+        return None
+    return number
+
+
+def _range_score(value: Any, ideal_range: Any) -> float | None:
+    """Score a metric from 0 to 100, with a one-range-width soft tolerance."""
+    value = _valid_number(value)
+    if value is None or not isinstance(ideal_range, (tuple, list)) or len(ideal_range) != 2:
+        return None
+
+    lower, upper = (_valid_number(bound) for bound in ideal_range)
+    if lower is None or upper is None or lower >= upper:
+        return None
+    if lower <= value <= upper:
+        return 100.0
+
+    # Values outside the ideal band lose points gradually, then reach zero.
+    width = upper - lower
+    distance = lower - value if value < lower else value - upper
+    return max(0.0, 100.0 * (1.0 - distance / width))
+
+
+def calculate_variety_suitability(
+    farm_metrics: Mapping[str, Any],
+    variety_profile: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a percentage and frontend-ready rating for one rice variety.
+
+    ``farm_metrics`` accepts ``soil_ph`` and ``average_temperature``.  The
+    profile may override ``ideal_ph_range`` and ``ideal_temperature_range``;
+    if omitted, the module uses the defaults above. Invalid, missing, or
+    negative farm values are ignored rather than raising an exception.
+    """
+    metrics = farm_metrics if isinstance(farm_metrics, Mapping) else {}
+    profile = variety_profile if isinstance(variety_profile, Mapping) else {}
+
+    ph_score = _range_score(
+        metrics.get("soil_ph"), profile.get("ideal_ph_range", DEFAULT_PROFILE["ideal_ph_range"])
+    )
+    temperature_score = _range_score(
+        metrics.get("average_temperature"),
+        profile.get("ideal_temperature_range", DEFAULT_PROFILE["ideal_temperature_range"]),
+    )
+
+    valid_scores = [score for score in (ph_score, temperature_score) if score is not None]
+    percentage = round(sum(valid_scores) / len(valid_scores), 2) if valid_scores else 0.0
+
+    if percentage >= 80:
+        rating = "Highly Recommended"
+    elif percentage >= 60:
+        rating = "Suitable"
+    else:
+        rating = "Not Recommended"
+
+    return {
+        "suitability_score": percentage,
+        "rating": rating,
+        "metric_scores": {
+            "soil_ph": round(ph_score, 2) if ph_score is not None else None,
+            "average_temperature": round(temperature_score, 2) if temperature_score is not None else None,
+        },
+    }
